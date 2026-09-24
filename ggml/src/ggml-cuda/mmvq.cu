@@ -1104,10 +1104,13 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const int     blocks_per_iter_1warp = vdr * warp_size / qi;
 
     const auto should_use_small_k = [&](int c_ncols_dst) {
+        const bool is_nvidia_maxwell = GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_PASCAL;
+
         // When K is small, increase rows_per_block to match nwarps so each warp has more work to do
         // Trigger when the full thread block covers all K blocks in a single loop iteration and few threads remain idle.
+        // On Maxwell more rows per block is faster for any K.
         const int  nwarps = calc_nwarps(type, c_ncols_dst, table_id);
-        bool       use    = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
+        bool       use    = nwarps > 1 && (is_nvidia_maxwell || blocks_per_row_x < nwarps * blocks_per_iter_1warp);
 
         constexpr std::array<ggml_type, 2> iq_slow_turing = {
             GGML_TYPE_IQ3_XXS,
