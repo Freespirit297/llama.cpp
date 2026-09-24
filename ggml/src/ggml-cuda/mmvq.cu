@@ -100,7 +100,8 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_RDNA2,
     MMVQ_PARAMETERS_RDNA3_0,
     MMVQ_PARAMETERS_RDNA4,
-    MMVQ_PARAMETERS_GB10
+    MMVQ_PARAMETERS_GB10,
+    MMVQ_PARAMETERS_MAXWELL
 };
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
@@ -116,6 +117,8 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_TURING;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
     return MMVQ_PARAMETERS_GB10;
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ < GGML_CUDA_CC_PASCAL
+    return MMVQ_PARAMETERS_MAXWELL;
 #else
     return MMVQ_PARAMETERS_GENERIC;
 #endif
@@ -139,6 +142,9 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_DGX_SPARK) {
         return MMVQ_PARAMETERS_GB10;
+    }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_PASCAL) {
+        return MMVQ_PARAMETERS_MAXWELL;
     }
     return MMVQ_PARAMETERS_GENERIC;
 }
@@ -573,11 +579,22 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         }
         return generic;
     }
+    if (table_id == MMVQ_PARAMETERS_MAXWELL) {
+        // Batch size 1: one warp per block, rows per block see calc_rows_per_block.
+        // A single warp avoids the cross-warp reduction and runs faster for any K, except Q8_0.
+        if (ncols_dst == 1 && type != GGML_TYPE_Q8_0) {
+            return 1;
+        }
+        return calc_nwarps(type, ncols_dst, MMVQ_PARAMETERS_GENERIC);
+    }
     return 1;
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+    if (table_id == MMVQ_PARAMETERS_MAXWELL && ncols_dst == 1) {
+        return 4;
+    }
+    if (table_id == MMVQ_PARAMETERS_MAXWELL || table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
                 return small_k ? nwarps : 1;
@@ -1104,13 +1121,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const int     blocks_per_iter_1warp = vdr * warp_size / qi;
 
     const auto should_use_small_k = [&](int c_ncols_dst) {
-        const bool is_nvidia_maxwell = GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_PASCAL;
-
         // When K is small, increase rows_per_block to match nwarps so each warp has more work to do
         // Trigger when the full thread block covers all K blocks in a single loop iteration and few threads remain idle.
-        // On Maxwell more rows per block is faster for any K.
         const int  nwarps = calc_nwarps(type, c_ncols_dst, table_id);
-        bool       use    = nwarps > 1 && (is_nvidia_maxwell || blocks_per_row_x < nwarps * blocks_per_iter_1warp);
+        bool       use    = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
 
         constexpr std::array<ggml_type, 2> iq_slow_turing = {
             GGML_TYPE_IQ3_XXS,
