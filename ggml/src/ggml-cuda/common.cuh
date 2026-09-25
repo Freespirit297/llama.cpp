@@ -1464,6 +1464,10 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // q8_1 copy of the last MMVQ src1, reused by following mat-vec products with the same src1
+    void              * mmvq_src1_q8_1_buf = nullptr;
+    const ggml_tensor * mmvq_src1_q8_1_key = nullptr;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)

@@ -1515,12 +1515,36 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    const size_t  src1_q8_1_size = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+
+    // q/k/v and gate/up share src1: keep its q8_1 copy in a per-context buffer and skip re-quantizing.
+    // src1 cannot change in between because the allocator does not reuse its memory while it has consumers left.
+    // The cache is reset at the start of every graph, only used on the main stream and only for graph nodes
+    // (temporary slices, e.g. from the MUL_MAT_ID fallback, reuse the same host address with different data).
+    const bool use_cache = ctx.curr_stream_no == 0 && dst->src[1] == src1 && src1_q8_1_size <= MMVQ_SRC1_CACHE_SIZE;
+    if (use_cache && ctx.mmvq_src1_q8_1_buf == nullptr) {
+        cudaStreamCaptureStatus capture_status;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+        if (capture_status == cudaStreamCaptureStatusNone) {
+            CUDA_CHECK(cudaMalloc(&ctx.mmvq_src1_q8_1_buf, MMVQ_SRC1_CACHE_SIZE));
+        }
+    }
+
+    ggml_cuda_pool_alloc<char> src1_q8_1_alloc(ctx.pool());
+    char * src1_q8_1;
+    bool   quantize = true;
+    if (use_cache && ctx.mmvq_src1_q8_1_buf != nullptr) {
+        src1_q8_1 = (char *) ctx.mmvq_src1_q8_1_buf;
+        quantize  = ctx.mmvq_src1_q8_1_key != src1;
+        ctx.mmvq_src1_q8_1_key = src1;
+    } else {
+        src1_q8_1 = src1_q8_1_alloc.alloc(src1_q8_1_size);
+    }
+    if (quantize) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1546,7 +1570,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

@@ -1,6 +1,7 @@
 #include "common.cuh"
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
+#define MMVQ_SRC1_CACHE_SIZE (1024*1024) // Bytes per context for the q8_1 copy of src1 reused across MMVQ calls.
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
