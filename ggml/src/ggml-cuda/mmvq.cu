@@ -37,11 +37,81 @@ static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
+// PTQ1_0 without dp4a (Maxwell): __vsub4 and the dp4a fallback are emulated there, which makes the shared
+// path compute bound. Take each base-3 digit d in {0,1,2} straight from the multiply-by-3 decode and
+// accumulate (d - 1) * u per value with 16-bit multiply-adds.
+// mad.wide.s16 is a single XMAD; a plain int multiply is three on Maxwell.
+static __device__ __forceinline__ int mad_s16(const int a, const int b, int c) {
+    asm("mad.wide.s16 %0, %1, %2, %0;" : "+r"(c) : "h"((short) a), "h"((short) b));
+    return c;
+}
+
+// w_lo/w_hi: two 16-bit lanes each with a digit in bits 8-9, for values 0-1 and 2-3 of u.
+static __device__ __forceinline__ int ptq1_0_dot4_nodp4a(const uint32_t w_lo, const uint32_t w_hi, const int u, int sum) {
+    sum = mad_s16((int) ((w_lo >>  8) & 3) - 1, (int8_t) (u >>  0), sum);
+    sum = mad_s16((int)  (w_lo >> 24)      - 1, (int8_t) (u >>  8), sum);
+    sum = mad_s16((int) ((w_hi >>  8) & 3) - 1, (int8_t) (u >> 16), sum);
+    sum = mad_s16((int)  (w_hi >> 24)      - 1, (int8_t) (u >> 24), sum);
+    return sum;
+}
+
+static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1_nodp4a(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+    const block_ptq1_0 * bq = (const block_ptq1_0 *) vbq + kbx;
+    int sumi[4] = {0, 0, 0, 0};
+
+    // qs: 24 bytes of 5 digits; words 0-3 hold values t*16 + 4*g + 0..3, words 4-5 values 80 + t*8 + 4*(g - 4) + 0..3
+#pragma unroll
+    for (int g = 0; g < 6; ++g) {
+        const uint32_t packed = get_int_b4(bq->qs, g);
+        uint32_t v_lo = __byte_perm(packed, 0, 0x4140);
+        uint32_t v_hi = __byte_perm(packed, 0, 0x4342);
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo + (v_lo << 1);
+            const uint32_t w_hi = v_hi + (v_hi << 1);
+            v_lo = w_lo & 0x00FF00FF;
+            v_hi = w_hi & 0x00FF00FF;
+            const int e = g < 4 ? t*16 + 4*g : 80 + t*8 + 4*(g - 4);
+            const int u = get_int_b4(bq8_1[iqs + (e >> 5)].qs, (e & 31) >> 2);
+            sumi[e >> 5] = ptq1_0_dot4_nodp4a(w_lo, w_hi, u, sumi[e >> 5]);
+        }
+    }
+
+    // qh: 2 bytes of 4 digits, values 120 + 2*t + h
+    uint32_t v = (uint32_t) bq->qh[0] | ((uint32_t) bq->qh[1] << 16);
+#pragma unroll
+    for (int t = 0; t < 4; t += 2) {
+        const uint32_t w0 = v + (v << 1);
+        v = w0 & 0x00FF00FF;
+        const uint32_t w1 = v + (v << 1);
+        v = w1 & 0x00FF00FF;
+        const int u = get_int_b4(bq8_1[iqs + 3].qs, 6 + t/2);
+        sumi[3] = ptq1_0_dot4_nodp4a(w0, w1, u, sumi[3]);
+    }
+
+    float acc = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        acc += __low2float(bq8_1[iqs + k].ds) * (float) sumi[k];
+    }
+    return (float) bq->d * acc;
+}
+
+static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1_mmvq(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < GGML_CUDA_CC_DP4A && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    return vec_dot_ptq1_0_q8_1_nodp4a(vbq, bq8_1, kbx, iqs);
+#else
+    return vec_dot_ptq1_0_q8_1(vbq, bq8_1, kbx, iqs);
+#endif
+}
+
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
         case GGML_TYPE_Q2_0:    return vec_dot_q2_0_q8_1;
-        case GGML_TYPE_PTQ1_0:  return vec_dot_ptq1_0_q8_1;
+        case GGML_TYPE_PTQ1_0:  return vec_dot_ptq1_0_q8_1_mmvq;
         case GGML_TYPE_Q4_0:    return vec_dot_q4_0_q8_1;
         case GGML_TYPE_Q4_1:    return vec_dot_q4_1_q8_1;
         case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1;
@@ -598,9 +668,10 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1, ggml_type type = GGML_TYPE_COUNT) {
     if (table_id == MMVQ_PARAMETERS_MAXWELL && ncols_dst == 1) {
-        return 4;
+        // PTQ1_0 decodes 128 values per call: 2 rows keep the registers low enough (4 rows: 297 vs 257 us)
+        return type == GGML_TYPE_PTQ1_0 ? 2 : 4;
     }
     if (table_id == MMVQ_PARAMETERS_MAXWELL || table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
@@ -640,7 +711,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps, type);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -1065,7 +1136,7 @@ static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps, type);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -1158,6 +1229,28 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const int                     cc        = ggml_cuda_info().devices[device].cc;
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
     const mmvq_parameter_table_id table_id  = get_device_table_id(cc);
+
+    // PTQ1_0 on Maxwell: wider launches lose more to register pressure than decoding once saves
+    // (8 columns: 4.7 ms vs 8 x 0.26 ms), so a batch runs as single-column launches.
+    if constexpr (type == GGML_TYPE_PTQ1_0) {
+        if (table_id == MMVQ_PARAMETERS_MAXWELL && ncols_dst > 1 && ids == nullptr &&
+                fusion.x_scale == nullptr && fusion.gate_scale == nullptr && fusion.shared_dst == nullptr) {
+            for (int j = 0; j < ncols_dst; ++j) {
+                ggml_cuda_mm_fusion_args_device fusion_j = fusion;
+                if (fusion.x_bias) {
+                    fusion_j.x_bias = (const float *) fusion.x_bias + (int64_t) j*stride_col_dst;
+                }
+                if (fusion.gate_bias) {
+                    fusion_j.gate_bias = (const float *) fusion.gate_bias + (int64_t) j*stride_col_dst;
+                }
+                mul_mat_vec_q_switch_ncols_dst<type>(vx, (const block_q8_1 *) vy + (int64_t) j*stride_col_y, ids, fusion_j,
+                    dst + (int64_t) j*stride_col_dst, ncols_x, nrows_x, 1, stride_row_x, stride_col_y, stride_col_dst,
+                    nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            }
+            return;
+        }
+    }
 
     const bool has_ids = ids != nullptr;
 
